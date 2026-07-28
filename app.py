@@ -1,299 +1,228 @@
-import streamlit as st
+"""
+비전 품질 검사 PoC - Streamlit App
+
+배포 구조 (GitHub: visionapp)
+    visionapp/
+    ├── app.py
+    ├── requirements.txt
+    └── lesson06_vision_model.joblib
+"""
+
+import io
+import os
+import tempfile
+import urllib.request
+from pathlib import Path
+
 import joblib
-from PIL import Image
 import numpy as np
-import requests
-from io import BytesIO
+import streamlit as st
+from PIL import Image
 
-# --------------------------------------------------
-# 기본 설정
-# --------------------------------------------------
-st.set_page_config(
-    page_title="불량 검사 AI 모델 데모",
-    page_icon="🔍",
-    layout="wide"
-)
-
-FEATURE_SIZE = (64, 160)
-
-# GitHub에 저장된 모델의 Raw 주소로 변경하세요.
+# --- 0. 경로 설정 --------------------------------------------------------
+# __file__ 기준 상대경로 → 로컬/Cloud 어디서 실행해도 동일하게 동작
+APP_DIR = Path(__file__).resolve().parent
 MODEL_FILENAME = "lesson06_vision_model.joblib"
-)
+MODEL_PATH = APP_DIR / MODEL_FILENAME
+
+REQUIRED_KEYS = {
+    "model",
+    "feature_size",
+    "operating_threshold",
+    "quality_limits",
+    "class_names",
+}
 
 
-# --------------------------------------------------
-# 특징 추출 및 품질 측정 함수
-# --------------------------------------------------
-def quality_metrics(image):
-    a = np.asarray(
-        image.resize(FEATURE_SIZE),
-        dtype=np.float32
-    )
+def _get_model_url() -> str:
+    """모델 파일을 리포지토리에 직접 못 넣는 경우(용량 등)를 위한 폴백 URL."""
+    try:
+        if "MODEL_URL" in st.secrets:
+            return str(st.secrets["MODEL_URL"])
+    except Exception:
+        pass  # secrets.toml 이 없으면 무시
+    return os.environ.get("MODEL_URL", "")
 
+
+# --- 1. 모델 로드 (캐시) -------------------------------------------------
+@st.cache_resource(show_spinner="모델을 불러오는 중입니다...")
+def load_model_bundle():
+    path = MODEL_PATH
+
+    if not path.exists():
+        url = _get_model_url()
+        if not url:
+            raise FileNotFoundError(
+                f"'{MODEL_FILENAME}' 을(를) 찾을 수 없습니다.\n"
+                f"확인한 경로: {path}\n\n"
+                "리포지토리 루트(app.py와 같은 위치)에 모델 파일을 커밋했는지, "
+                "또는 Secrets에 MODEL_URL 을 설정했는지 확인하세요."
+            )
+        # 리포지토리 외부에서 내려받는 경우 임시 디렉터리에 저장
+        path = Path(tempfile.gettempdir()) / MODEL_FILENAME
+        if not path.exists():
+            urllib.request.urlretrieve(url, path)
+
+    bundle = joblib.load(path)
+
+    missing = REQUIRED_KEYS - set(bundle)
+    if missing:
+        raise KeyError(f"모델 번들에 다음 키가 없습니다: {sorted(missing)}")
+    return bundle
+
+
+try:
+    model_bundle = load_model_bundle()
+except Exception as exc:  # 사용자에게 원인을 그대로 보여줌
+    st.set_page_config(page_title="비전 품질 검사 PoC", layout="wide")
+    st.title("비전 품질 검사 PoC")
+    st.error(f"모델 로드 실패\n\n{exc}")
+    st.stop()
+
+model = model_bundle["model"]
+FEATURE_SIZE = tuple(model_bundle["feature_size"])  # (width, height)
+OPERATING_THRESHOLD = float(model_bundle["operating_threshold"])
+quality_limits = model_bundle["quality_limits"]
+class_names = model_bundle["class_names"]
+
+
+# --- 2. 특징 추출 / 품질 게이트 ------------------------------------------
+# ※ 학습 노트북과 반드시 동일한 로직이어야 합니다. 수정 금지.
+def quality_metrics(image: Image.Image) -> dict:
+    a = np.asarray(image.resize(FEATURE_SIZE), dtype=np.float32)
     gx = np.diff(a, axis=1, prepend=a[:, :1])
     gy = np.diff(a, axis=0, prepend=a[:1, :])
-
-    lap = (
-        -4 * a
-        + np.roll(a, 1, 0)
-        + np.roll(a, -1, 0)
-        + np.roll(a, 1, 1)
-        + np.roll(a, -1, 1)
-    )
-
+    lap = -4 * a + np.roll(a, 1, 0) + np.roll(a, -1, 0) + np.roll(a, 1, 1) + np.roll(a, -1, 1)
     return {
         "brightness": float(a.mean()),
         "contrast": float(a.std()),
         "sharpness": float(lap.var()),
-        "mean_gradient": float(np.hypot(gx, gy).mean())
+        "mean_gradient": float(np.hypot(gx, gy).mean()),
     }
 
 
-def extract_features(image):
+def extract_features(image: Image.Image) -> np.ndarray:
     a = np.asarray(
-        image.resize(
-            FEATURE_SIZE,
-            Image.Resampling.BILINEAR
-        ),
-        dtype=np.float32
-    ) / 255.0
-
+        image.resize(FEATURE_SIZE, Image.Resampling.BILINEAR), dtype=np.float32
+    ) / 255
     gx = np.diff(a, axis=1, prepend=a[:, :1])
     gy = np.diff(a, axis=0, prepend=a[:1, :])
-
     mag = np.hypot(gx, gy)
     ori = (np.degrees(np.arctan2(gy, gx)) + 180) % 180
 
-    hog = []
-    bins = np.linspace(0, 180, 10)
-
-    for row in range(0, 160, 8):
-        for col in range(0, 64, 8):
+    hog, bins = [], np.linspace(0, 180, 10)
+    for row in range(0, FEATURE_SIZE[1], 8):
+        for col in range(0, FEATURE_SIZE[0], 8):
             hist, _ = np.histogram(
                 ori[row:row + 8, col:col + 8],
                 bins=bins,
-                weights=mag[row:row + 8, col:col + 8]
+                weights=mag[row:row + 8, col:col + 8],
             )
             hog.extend(hist / (hist.sum() + 1e-6))
 
-    intensity, _ = np.histogram(
-        a,
-        bins=16,
-        range=(0, 1),
-        density=True
-    )
-
-    percentiles = np.percentile(
-        a,
-        [1, 5, 25, 50, 75, 95, 99]
-    )
-
+    intensity, _ = np.histogram(a, bins=16, range=(0, 1), density=True)
+    percentiles = np.percentile(a, [1, 5, 25, 50, 75, 95, 99])
     extra = [
         a.mean(),
         a.std(),
         mag.mean(),
         np.percentile(mag, 90),
-        np.percentile(mag, 99)
+        np.percentile(mag, 99),
     ]
-
-    return np.concatenate([
-        hog,
-        intensity,
-        percentiles,
-        extra
-    ])
+    return np.concatenate([hog, intensity, percentiles, extra])
 
 
-# --------------------------------------------------
-# GitHub 모델 로드
-# --------------------------------------------------
-@st.cache_resource(show_spinner="GitHub에서 AI 모델을 불러오는 중입니다...")
-def load_model_bundle():
-    try:
-        response = requests.get(
-            MODEL_URL,
-            timeout=60
-        )
-        response.raise_for_status()
-
-        # Git LFS 포인터 파일이 내려온 경우 확인
-        if response.content.startswith(
-            b"version https://git-lfs.github.com/spec"
-        ):
-            raise RuntimeError(
-                "실제 모델 파일이 아닌 Git LFS 포인터가 내려왔습니다. "
-                "GitHub Release 또는 일반 파일 다운로드 주소를 사용해주세요."
-            )
-
-        return joblib.load(BytesIO(response.content))
-
-    except requests.RequestException as error:
-        raise RuntimeError(
-            f"GitHub에서 모델 파일을 다운로드하지 못했습니다: {error}"
-        ) from error
-
-    except Exception as error:
-        raise RuntimeError(
-            f"모델 파일을 불러오는 중 오류가 발생했습니다: {error}"
-        ) from error
-
-
-try:
-    model_bundle = load_model_bundle()
-
-    required_keys = {
-        "model",
-        "operating_threshold",
-        "quality_limits",
-        "class_names"
-    }
-
-    missing_keys = required_keys - set(model_bundle.keys())
-
-    if missing_keys:
-        raise KeyError(
-            f"모델 번들에 필요한 항목이 없습니다: {sorted(missing_keys)}"
-        )
-
-    model = model_bundle["model"]
-    operating_threshold = float(
-        model_bundle["operating_threshold"]
-    )
-    quality_limits = model_bundle["quality_limits"]
-    class_names = model_bundle["class_names"]
-
-except Exception as error:
-    st.error(str(error))
-    st.info(
-        "MODEL_URL이 GitHub의 Raw 파일 주소인지 확인해주세요."
-    )
-    st.stop()
-
-
-def quality_ok(q):
+def quality_ok(q: dict) -> bool:
     return (
-        quality_limits["brightness_low"]
-        <= q["brightness"]
-        <= quality_limits["brightness_high"]
-        and q["contrast"]
-        >= quality_limits["contrast_low"]
-        and q["sharpness"]
-        >= quality_limits["sharpness_low"]
+        quality_limits["brightness_low"] <= q["brightness"] <= quality_limits["brightness_high"]
+        and q["contrast"] >= quality_limits["contrast_low"]
+        and q["sharpness"] >= quality_limits["sharpness_low"]
     )
 
 
-# --------------------------------------------------
-# Streamlit 화면
-# --------------------------------------------------
-st.title("🔍 불량 검사 AI 모델 데모")
-st.write(
-    "새로운 이미지를 업로드하면 AI가 불량 여부와 "
-    "이미지 품질을 분석합니다."
-)
+# --- 3. UI ---------------------------------------------------------------
+st.set_page_config(page_title="비전 품질 검사 PoC", layout="wide")
+st.title("비전 품질 검사 PoC")
+st.caption("이미지를 업로드하면 불량 여부를 판정합니다.")
+
+with st.sidebar:
+    st.header("설정")
+    threshold = st.slider(
+        "판정 임계값",
+        min_value=0.0,
+        max_value=1.0,
+        value=OPERATING_THRESHOLD,
+        step=0.01,
+        help=f"모델 기본 운영 임계값: {OPERATING_THRESHOLD:.4f}",
+    )
+    st.divider()
+    st.caption(f"입력 크기: {FEATURE_SIZE[0]}×{FEATURE_SIZE[1]}")
+    st.caption(f"클래스: {', '.join(map(str, class_names))}")
 
 uploaded_file = st.file_uploader(
-    "검사할 이미지 파일을 선택하세요.",
-    type=["jpg", "jpeg", "png", "bmp"]
+    "이미지를 업로드하세요", type=["jpg", "jpeg", "png", "bmp"]
 )
 
-if uploaded_file is not None:
-    try:
-        image = Image.open(uploaded_file).convert("L")
-    except Exception:
-        st.error("이미지를 열 수 없습니다. 정상적인 이미지 파일인지 확인해주세요.")
+if uploaded_file is None:
+    st.info("이미지를 업로드하여 판정을 시작해주세요.")
+    st.stop()
+
+image = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("L")
+
+col1, col2 = st.columns([1, 1])
+with col1:
+    st.image(image, caption="업로드된 이미지 (Grayscale)", use_container_width=True)
+
+with col2:
+    if not st.button("이미지 판정하기", type="primary"):
         st.stop()
 
-    st.divider()
+    features = extract_features(image)
+    q = quality_metrics(image)
 
-    col1, col2 = st.columns(2)
+    probability = float(model.predict_proba(features.reshape(1, -1))[0, 1])
+    prediction = int(probability >= threshold)
+    predicted_class = class_names[prediction]
 
-    with col1:
-        st.subheader("업로드된 이미지")
-        st.image(
-            image,
-            caption="업로드된 원본 이미지",
-            use_container_width=True
-        )
+    gate_pass = quality_ok(q)
+    routing_status = (
+        "RECAPTURE_OR_HUMAN_REVIEW"
+        if not gate_pass
+        else "DEFECT_CANDIDATE_REVIEW"
+        if prediction
+        else "POLICY_PASS"
+    )
 
-    with col2:
-        st.subheader("분석 결과")
+    st.subheader("판정 결과")
 
-        try:
-            features = extract_features(image).reshape(1, -1)
-            quality = quality_metrics(image)
+    color = "#d62728" if str(predicted_class).upper() == "DEFECT" else "#2ca02c"
+    st.markdown(
+        f"### <span style='color:{color}'>{predicted_class}</span>",
+        unsafe_allow_html=True,
+    )
 
-            probabilities = model.predict_proba(features)[0]
-            defect_probability = float(probabilities[1])
+    m1, m2 = st.columns(2)
+    m1.metric("불량 확률", f"{probability:.4f}")
+    m2.metric("품질 게이트", "통과" if gate_pass else "미달")
 
-            prediction_label = (
-                1
-                if defect_probability >= operating_threshold
-                else 0
-            )
+    st.write(f"**라우팅 상태:** `{routing_status}`")
+    st.progress(min(max(probability, 0.0), 1.0))
 
-            predicted_class = class_names[prediction_label]
-            gate_pass = quality_ok(quality)
-
-            if not gate_pass:
-                routing_status = "RECAPTURE_OR_HUMAN_REVIEW"
-            elif prediction_label == 1:
-                routing_status = "DEFECT_CANDIDATE_REVIEW"
-            else:
-                routing_status = "POLICY_PASS"
-
-            st.metric(
-                "불량 확률",
-                f"{defect_probability:.1%}"
-            )
-
-            st.markdown(
-                f"**운영 임계값:** `{operating_threshold:.2f}`"
-            )
-            st.markdown(
-                f"**AI 판정:** `{predicted_class}`"
-            )
-            st.markdown(
-                f"**품질 게이트 통과:** `{gate_pass}`"
-            )
-            st.markdown(
-                f"**최종 라우팅 상태:** `{routing_status}`"
-            )
-
-            st.subheader("이미지 품질 지표")
-
-            metric_col1, metric_col2 = st.columns(2)
-
-            with metric_col1:
-                st.metric(
-                    "밝기",
-                    f"{quality['brightness']:.2f}"
-                )
-                st.metric(
-                    "선명도",
-                    f"{quality['sharpness']:.2f}"
-                )
-
-            with metric_col2:
-                st.metric(
-                    "대비",
-                    f"{quality['contrast']:.2f}"
-                )
-                st.metric(
-                    "평균 경사도",
-                    f"{quality['mean_gradient']:.2f}"
-                )
-
-            if not gate_pass:
-                st.warning(
-                    "이미지 품질이 기준에 미달하여 "
-                    "재촬영 또는 사람의 검토가 필요합니다."
-                )
-            elif prediction_label == 1:
-                st.info(
-                    "불량 후보로 감지되었습니다. 추가 검토가 필요합니다."
-                )
-            else:
-                st.success("정상 이미지로 판정되었습니다.")
-
-        except Exception as error:
-            st.error(f"이미지 분석 중 오류가 발생했습니다: {error}")
+    st.markdown("#### 품질 기준")
+    st.table(
+        {
+            "항목": ["밝기", "대비", "선명도", "평균 그래디언트"],
+            "측정값": [
+                f"{q['brightness']:.2f}",
+                f"{q['contrast']:.2f}",
+                f"{q['sharpness']:.2f}",
+                f"{q['mean_gradient']:.2f}",
+            ],
+            "기준": [
+                f"{quality_limits['brightness_low']:.2f} ~ {quality_limits['brightness_high']:.2f}",
+                f"≥ {quality_limits['contrast_low']:.2f}",
+                f"≥ {quality_limits['sharpness_low']:.2f}",
+                "-",
+            ],
+        }
+    )
